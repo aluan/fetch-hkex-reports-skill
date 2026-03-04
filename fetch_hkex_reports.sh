@@ -115,8 +115,19 @@ agent-browser --headed wait 500
 
 # 8. 点击搜索按钮
 echo "步骤 8/9: 点击搜索按钮..."
-SEARCH_REF=$(grep "link \"搜尋\"" /tmp/hkex_snapshot.txt | head -1 | sed -n 's/.*\[ref=\(e[0-9]*\)\].*/\1/p')
-agent-browser --headed click "$SEARCH_REF"
+# 使用 class 包含 container-title-search 的容器，减少对具体类名结构的依赖
+agent-browser --headed eval --stdin <<'EVALEOF'
+const container = document.querySelector('div[class*="container-title-search"]');
+if (!container) throw new Error('未找到公告查询表单容器');
+const btn = Array.from(container.querySelectorAll('button, a, input'))
+  .find(el => {
+    const text = (el.textContent || el.value || '').trim();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    return text === '搜尋' || type === 'submit';
+  });
+if (!btn) throw new Error('未找到表单內的搜尋按钮');
+btn.click();
+EVALEOF
 agent-browser --headed wait --load networkidle
 agent-browser --headed wait 2000
 
