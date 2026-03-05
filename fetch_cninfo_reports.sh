@@ -1,9 +1,50 @@
 #!/bin/bash
 
 # 从巨潮资讯网获取A股上市公司年报/半年度报告
-# Usage: ./fetch_cninfo_reports.sh <公司名称或代码> [开始日期] [结束日期]
+# Usage: ./fetch_cninfo_reports.sh <公司名称或代码> [开始日期] [结束日期] [--download] [--download-dir DIR]
 
 set -euo pipefail
+
+DOWNLOAD_PDF="${DOWNLOAD_PDF:-0}"
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-./downloads}"
+
+POSITIONAL_ARGS=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --download)
+            DOWNLOAD_PDF=1
+            shift
+            ;;
+        --download-dir)
+            if [ "$#" -lt 2 ]; then
+                echo "错误: --download-dir 需要参数" >&2
+                exit 1
+            fi
+            DOWNLOAD_PDF=1
+            DOWNLOAD_DIR="$2"
+            shift 2
+            ;;
+        --download-dir=*)
+            DOWNLOAD_PDF=1
+            DOWNLOAD_DIR="${1#*=}"
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            POSITIONAL_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ "$#" -gt 0 ]; then
+    POSITIONAL_ARGS+=("$@")
+fi
+
+set -- "${POSITIONAL_ARGS[@]}"
 
 COMPANY_KEY="${1:-}"
 START_DATE_INPUT="${2:-}"
@@ -13,9 +54,14 @@ JSON_ONLY="${CNINFO_JSON_ONLY:-0}"
 if [ -z "$COMPANY_KEY" ]; then
     if [ "$JSON_ONLY" != "1" ]; then
         echo "错误: 请提供公司名称或股票代码"
-        echo "用法: $0 <公司名称或代码> [开始日期] [结束日期]"
-        echo "示例: $0 平安银行 2024-01-01 2024-12-31"
+        echo "用法: $0 <公司名称或代码> [开始日期] [结束日期] [--download] [--download-dir DIR]"
+        echo "示例: $0 平安银行 2024-01-01 2024-12-31 --download"
     fi
+    exit 1
+fi
+
+if [ "$DOWNLOAD_PDF" = "1" ] && [ -z "$DOWNLOAD_DIR" ]; then
+    echo "错误: --download-dir 不能为空" >&2
     exit 1
 fi
 
@@ -70,7 +116,8 @@ PY
 }
 
 TMP_JS="$(mktemp /tmp/cninfo_eval.XXXXXX.js)"
-trap 'rm -f "$TMP_JS"' EXIT
+TMP_JSON="$(mktemp /tmp/cninfo_reports.XXXXXX.json)"
+trap 'rm -f "$TMP_JS" "$TMP_JSON"' EXIT
 
 python3 - "$COMPANY_KEY" "$START_DATE" "$END_DATE" "$PAGE_SIZE" "$MAX_PAGES" "$PLATE" "$CATEGORY" "$API_URL" "$BASE_URL" > "$TMP_JS" <<'PY'
 import json
@@ -175,7 +222,62 @@ PY
 
 agent-browser $CNINFO_BROWSER_FLAGS open http://www.cninfo.com.cn/ >/dev/null
 agent-browser $CNINFO_BROWSER_FLAGS wait --load networkidle >/dev/null
-agent-browser $CNINFO_BROWSER_FLAGS eval --stdin < "$TMP_JS" | python3 -m json.tool
+agent-browser $CNINFO_BROWSER_FLAGS eval --stdin < "$TMP_JS" > "$TMP_JSON"
+
+cat "$TMP_JSON" | python3 -m json.tool
+
+sanitize_filename() {
+    echo "$1" | sed -e 's/[\\/:*?"<>|]/_/g' -e 's/[[:space:]]\\+/ /g' -e 's/^ *//; s/ *$//' -e 's/ /_/g' | cut -c1-150
+}
+
+download_pdfs() {
+    local json_file="$1"
+    local out_dir="$2"
+
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "错误: 未找到 curl，无法下载 PDF" >&2
+        return 1
+    fi
+
+    mkdir -p "$out_dir"
+
+    python3 - "$json_file" <<'PY' | while IFS=$'\t' read -r idx name url; do
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+for i, item in enumerate(data, 1):
+    name = (item.get('name') or 'report').strip()
+    url = (item.get('url') or '').strip()
+    if not url:
+        continue
+    print(f"{i}\t{name}\t{url}")
+PY
+        if [ -z "$idx" ] || [ -z "$url" ]; then
+            continue
+        fi
+        safe_name="$(sanitize_filename "$name")"
+        if [ -z "$safe_name" ]; then
+            safe_name="report"
+        fi
+        output_path="${out_dir}/${idx}_${safe_name}.pdf"
+        if [ "$JSON_ONLY" != "1" ]; then
+            echo "下载: ${output_path}"
+        fi
+        curl -L --fail --retry 3 -H 'User-Agent: Mozilla/5.0' -sS -o "$output_path" "$url"
+    done
+}
+
+if [ "$DOWNLOAD_PDF" = "1" ]; then
+    if [ "$JSON_ONLY" != "1" ]; then
+        echo ""
+        echo "开始下载 PDF 到: ${DOWNLOAD_DIR}"
+    fi
+    download_pdfs "$TMP_JSON" "$DOWNLOAD_DIR"
+fi
 
 if [ "$JSON_ONLY" != "1" ]; then
     echo ""
